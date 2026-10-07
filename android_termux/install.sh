@@ -13,7 +13,6 @@ echo "=== Python / OpenCV / numpy ==="
 pkg install -y python python-numpy opencv-python
 
 echo "=== pip パッケージ ==="
-pip install --upgrade pip
 pip install flask requests
 
 echo ""
