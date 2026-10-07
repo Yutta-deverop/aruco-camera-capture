@@ -1,0 +1,156 @@
+import cv2
+import datetime
+import time
+import requests
+import base64
+import json
+import numpy as np
+
+# === 設定項目 ===
+GAS_URL = "https://script.google.com/macros/s/AKfycbyEUdak05s3S0VzILdb81tOL12qP46cpXgWyrYxYsFAWlsueCozfnheESTSyxR25lJf/exec" # あなたのGASのURL
+MIN_INTERVAL = 5.0  # チャタリング防止（秒）
+
+# 保存する切り抜き画像のサイズ（横幅と縦幅のピクセル数）
+# ホワイトボードの比率に合わせて自由に調整してください（例：4:3 や 16:9）
+OUTPUT_WIDTH = 800
+OUTPUT_HEIGHT = 800
+
+# === 状態管理 ===
+is_inside = False          
+last_action_time = 0       
+
+def upload_to_drive_via_gas(frame, file_name):
+    """画像をBase64に変換し、GAS経由でGoogle Driveへ保存する"""
+    print(f"[{file_name}] 切り抜き画像をアップロード中...")
+    success, buffer = cv2.imencode('.jpg', frame)
+    if not success:
+        return
+        
+    base64_image = base64.b64encode(buffer).decode('utf-8')
+    payload = {"image": base64_image, "filename": file_name}
+    
+    try:
+        response = requests.post(GAS_URL, data=json.dumps(payload), headers={"Content-Type": "application/json"}, timeout=15)
+        if response.status_code == 200 and response.json().get("status") == "success":
+            print(f"成功: 切り抜き画像がDriveに保存されました: {response.json().get('file_name')}")
+        else:
+            print("GAS送信エラー")
+    except Exception as e:
+        print(f"通信エラー: {e}")
+
+def order_points(pts):
+    """4つの座標を [左上, 右上, 右下, 左下] の順番に整列する関数"""
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)] # X+Yが最小 ➔ 左上
+    rect[2] = pts[np.argmax(s)] # X+Yが最大 ➔ 右下
+    
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)] # Y-Xが最小 ➔ 右上
+    rect[3] = pts[np.argmax(diff)] # Y-Xが最大 ➔ 左下
+    return rect
+
+def crop_and_warp(frame, corners, ids):
+    """4つのマーカーで囲まれた範囲を検出し、真上からの長方形に変換・切り抜く"""
+    target_ids = [0, 1, 2, 3]
+    pts = []
+    
+    # ID: 0,1,2,3 のマーカーの中心点を集める
+    for i in range(len(ids)):
+        if ids[i][0] in target_ids:
+            # マーカーの4角の平均値（＝中心点）を計算
+            center = np.mean(corners[i][0], axis=0)
+            pts.append(center)
+            
+    if len(pts) != 4:
+        return None
+        
+    # 4つの中心点を[左上、右上、右下、左下]に並び替え
+    pts = np.array(pts, dtype="float32")
+    rect = order_points(pts)
+    
+    # 変換後の長方形の4角の座標を指定
+    dst = np.array([
+        [0, 0],
+        [OUTPUT_WIDTH - 1, 0],
+        [OUTPUT_WIDTH - 1, OUTPUT_HEIGHT - 1],
+        [0, OUTPUT_HEIGHT - 1]
+    ], dtype="float32")
+    
+    # 透視変換マトリクスを計算して、画像を切り抜く・引き伸ばす
+    M = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(frame, M, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+    return warped
+
+def main():
+    global is_inside, last_action_time
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("カメラを起動できませんでした。")
+        return
+
+    # ArUco検出器の初期化
+    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    aruco_params = cv2.aruco.DetectorParameters()
+    detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
+
+    print("枠内限定・自動切り抜き監視システム起動中... 'q' キーで終了")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        # 判定用のコピー画像（描画前の綺麗な画像）
+        clean_frame = frame.copy()
+        
+        # マーカー検出
+        corners, ids, _ = detector.detectMarkers(frame)
+        
+        valid_count = 0
+        if ids is not None:
+            cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+            for i in range(len(ids)):
+                if ids[i][0] in [0, 1, 2, 3]:
+                    valid_count += 1
+
+        # 画面表示用の文字
+        cv2.putText(frame, f"Targets: {valid_count}/4", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+
+        # 撮影ロジック
+        current_time = time.time()
+        if valid_count == 4:
+            if not is_inside:
+                if (current_time - last_action_time) > MIN_INTERVAL:
+                    print("--- [条件達成] 4隅を確認。枠内を切り抜きます ---")
+                    
+                    # 4つのマーカーの内側を切り抜く
+                    cropped_img = crop_and_warp(clean_frame, corners, ids)
+                    
+                    if cropped_img is not None:
+                        now = datetime.datetime.now()
+                        file_name = now.strftime("%Y%m%d_%H%M%S.jpg")
+                        
+                        # GASへ送信（切り抜いた画像を送信します）
+                        upload_to_drive_via_gas(cropped_img, file_name)
+                        
+                        # 確認用：切り抜いた画像をPC画面にも一瞬表示する
+                        cv2.imshow("Last Cropped Image", cropped_img)
+                        
+                    last_action_time = current_time
+                is_inside = True
+        else:
+            if is_inside:
+                print("枠外に出ました。")
+                is_inside = False
+                last_action_time = current_time
+
+        cv2.imshow("ArUco Crop Monitor", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()

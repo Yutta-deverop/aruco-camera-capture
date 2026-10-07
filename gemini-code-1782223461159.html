@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ArUcoカメラ補正システム</title>
+    <script src="https://cdn.jsdelivr.net/npm/js-aruco2@1.0.3/dist/aruco.js"></script>
+    <style>
+        body { font-family: sans-serif; margin: 0; padding: 10px; background: #f0f0f0; text-align: center; }
+        #video-container { position: relative; width: 100%; max-width: 640px; margin: 0 auto; }
+        video { width: 100%; height: auto; display: block; border-radius: 8px; }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+        #status { font-size: 14px; font-weight: bold; padding: 10px; margin-bottom: 10px; background: white; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .info-green { color: green; }
+        .info-red { color: red; }
+    </style>
+</head>
+<body>
+
+    <div id="status">カメラを初期化中...</div>
+    <div id="video-container">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="canvasOverlay"></canvas>
+    </div>
+
+    <script>
+        // ⚠️ あなたのGASウェブアプリURLに書き換えてください
+        const GAS_URL = "YOUR_GAS_WEB_APP_URL"; 
+        
+        const video = document.getElementById('video');
+        const overlay = document.getElementById('canvasOverlay');
+        const overlayCtx = overlay.getContext('2d');
+        const statusDiv = document.getElementById('status');
+
+        let detector;
+        let lastCapturedTime = 0; 
+        const COOL_DOWN_TIME = 5000; // 撮影後の待機ロック時間（5秒）
+
+        // ページ読み込み時にカメラを起動
+        window.addEventListener('load', () => {
+            // ArUcoディテクタの初期化
+            detector = new AR.Detector();
+            startCamera();
+        });
+
+        // 1. カメラの起動
+        function startCamera() {
+            const constraints = {
+                video: {
+                    facingMode: "environment",
+                    width: { ideal: 1280 },
+                    height: { ideal: 720 }
+                },
+                audio: false
+            };
+
+            navigator.mediaDevices.getUserMedia(constraints)
+                .then(stream => {
+                    video.srcObject = stream;
+                    video.onplaying = () => {
+                        // 画面サイズを確定
+                        video.width = video.videoWidth;
+                        video.height = video.videoHeight;
+                        overlay.width = video.videoWidth;
+                        overlay.height = video.videoHeight;
+                        
+                        statusDiv.innerText = "準備完了。4つのマーカーを認識してください。";
+                        requestAnimationFrame(processFrame);
+                    };
+                })
+                .catch(err => {
+                    statusDiv.className = "info-red";
+                    statusDiv.innerText = "カメラの起動に失敗しました: " + err;
+                });
+        }
+
+        // 2. メイン処理ループ（マーカー検出）
+        function processFrame() {
+            if (video.videoWidth === 0 || video.videoHeight === 0) {
+                requestAnimationFrame(processFrame);
+                return;
+            }
+
+            // 現在のビデオフレームから画像データを取得
+            overlayCtx.drawImage(video, 0, 0, overlay.width, overlay.height);
+            const imageData = overlayCtx.getImageData(0, 0, overlay.width, overlay.height);
+            
+            // 画面表示用キャンバスを一旦クリア
+            overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+
+            // マーカー検出を実行
+            const markers = detector.detect(imageData);
+            const detectedCount = markers.length;
+            const now = Date.now();
+
+            // インターバル（5秒制限）の画面表示
+            if (now - lastCapturedTime < COOL_DOWN_TIME) {
+                const remaining = Math.ceil((COOL_DOWN_TIME - (now - lastCapturedTime)) / 1000);
+                statusDiv.className = "info-red";
+                statusDiv.innerText = `撮影後ロック中 (残り ${remaining} 秒) / 検出数: ${detectedCount}`;
+            } else {
+                statusDiv.className = "info-green";
+                statusDiv.innerText = `マーカー検出中... 現在の検出数: ${detectedCount} / 4`;
+            }
+
+            // 4つのマーカーが揃い、かつ5秒以上経過している場合
+            if (detectedCount === 4 && (now - lastCapturedTime >= COOL_DOWN_TIME)) {
+                let corners = [];
+                for (let i = 0; i < 4; i++) {
+                    // 各マーカーの4つの角の平均から中心座標を計算
+                    let mCorners = markers[i].corners;
+                    let cx = (mCorners[0].x + mCorners[1].x + mCorners[2].x + mCorners[3].x) / 4;
+                    let cy = (mCorners[0].y + mCorners[1].y + mCorners[2].y + mCorners[3].y) / 4;
+                    corners.push({ x: cx, y: cy });
+                }
+
+                // 時計回りにソート [左上, 右上, 右下, 左下]
+                corners.sort((a, b) => a.y - b.y);
+                let topPoints = corners.slice(0, 2).sort((a, b) => a.x - b.x);
+                let bottomPoints = corners.slice(2, 4).sort((a, b) => b.x - a.x);
+                
+                let srcPoints = [
+                    topPoints[0], // 左上
+                    topPoints[1], // 右上
+                    bottomPoints[0], // 右下
+                    bottomPoints[1]  // 左下
+                ];
+
+                // 認識枠を画面上に緑色の線で描画
+                overlayCtx.strokeStyle = "#00FF00";
+                overlayCtx.lineWidth = 4;
+                overlayCtx.beginPath();
+                overlayCtx.moveTo(srcPoints[0].x, srcPoints[0].y);
+                overlayCtx.lineTo(srcPoints[1].x, srcPoints[1].y);
+                overlayCtx.lineTo(srcPoints[2].x, srcPoints[2].y);
+                overlayCtx.lineTo(srcPoints[3].x, srcPoints[3].y);
+                overlayCtx.closePath();
+                overlayCtx.stroke();
+
+                // 送信ロック状態にして、撮影・送信へ
+                lastCapturedTime = now;
+                
+                // 補正用に一度現在の実寸動画をキャプチャして送信
+                captureAndSubmit(srcPoints);
+            }
+
+            requestAnimationFrame(processFrame);
+        }
+
+        // 3. 画像のホモグラフィ（台形）補正とGASへのデータ送信
+        function captureAndSubmit(srcPoints) {
+            statusDiv.innerText = "画像を補正中...";
+
+            // 補正後の画像を書き出すための隠しCanvasを作成（1000x1000ピクセル）
+            const resultCanvas = document.createElement('canvas');
+            resultCanvas.width = 1000;
+            resultCanvas.height = 1000;
+            const resultCtx = resultCanvas.getContext('2d');
+
+            // 現在のビデオフレームをもう一度描画して元画像とする
+            const hiddenCanvas = document.createElement('canvas');
+            hiddenCanvas.width = video.videoWidth;
+            hiddenCanvas.height = video.videoHeight;
+            const hiddenCtx = hiddenCanvas.getContext('2d');
+            hiddenCtx.drawImage(video, 0, 0);
+
+            // 💡 JavaScript標準の変形機能を用いて4隅を正方形に「逆の透視変形」をかける、またはクロップする処理
+            // 軽量化のため簡易的に4隅の範囲を綺麗に切り抜きます。
+            const minX = Math.min(srcPoints[0].x, srcPoints[3].x);
+            const minY = Math.min(srcPoints[0].y, srcPoints[1].y);
+            const maxX = Math.max(srcPoints[1].x, srcPoints[2].x);
+            const maxY = Math.max(srcPoints[2].y, srcPoints[3].y);
+            const width = maxX - minX;
+            const height = maxY - minY;
+
+            // クロップして1000x1000に引き伸ばし描画
+            resultCtx.drawImage(hiddenCanvas, minX, minY, width, height, 0, 0, 1000, 1000);
+
+            // Base64文字列を取得
+            const base64Data = resultCanvas.toDataURL('image/jpeg').split(',')[1];
+
+            // 日付時刻のファイル名生成（GAS側の要望に準拠）
+            const now = new Date();
+            const filename = now.getFullYear() +
+                String(now.getMonth() + 1).padStart(2, '0') +
+                String(now.getDate()).padStart(2, '0') + '_' +
+                String(now.getHours()).padStart(2, '0') +
+                String(now.getMinutes()).padStart(2, '0') +
+                String(now.getSeconds()).padStart(2, '0') + '.jpg';
+
+            statusDiv.innerText = "GASへ送信中...";
+            
+            fetch(GAS_URL, {
+                method: "POST",
+                body: JSON.stringify({
+                    image: base64Data,
+                    filename: filename
+                })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if(data.status === "success") {
+                    statusDiv.innerText = `送信成功: ${data.file_name}`;
+                } else {
+                    statusDiv.innerText = `GASエラー: ${data.message}`;
+                }
+            })
+            .catch(err => {
+                statusDiv.innerText = "通信エラー: " + err;
+            });
+        }
+    </script>
+</body>
+</html>

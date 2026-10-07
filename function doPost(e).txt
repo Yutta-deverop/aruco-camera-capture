@@ -1,0 +1,23 @@
+function doPost(e) {
+  try {
+    // 送られてきたデータを解析
+    var data = JSON.parse(e.postData.contents);
+    var base64Data = data.image;
+    var fileName = data.filename;
+    
+    // 保存先のフォルダIDを指定
+    var folderId = "1Qh9FRwsKT62sXTbmv4iy5y-ofUhkq0V9"; 
+    var folder = DriveApp.getFolderById(folderId);
+    
+    // 画像をデコードして保存
+    var decodedData = Utilities.base64Decode(base64Data);
+    var blob = Utilities.newBlob(decodedData, "image/jpeg", fileName);
+    var file = folder.createFile(blob);
+    
+    return ContentService.createTextOutput(JSON.stringify({"status": "success", "file_name": file.getName()}))
+                         .setMimeType(ContentService.MimeType.JSON);
+  } catch(err) {
+    return ContentService.createTextOutput(JSON.stringify({"status": "error", "message": err.toString()}))
+                         .setMimeType(ContentService.MimeType.JSON);
+  }
+}

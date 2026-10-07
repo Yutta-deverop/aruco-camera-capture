@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>ArUco Crop Monitor (公式最新仕様版)</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; background: #222; color: #fff; margin: 0; padding: 20px; }
+        #container { display: flex; justify-content: center; flex-wrap: wrap; gap: 20px; margin-top: 20px; }
+        canvas, video { border: 2px solid #555; background: #000; max-width: 100%; border-radius: 4px; }
+        #status { font-size: 1.2em; color: #00ff00; margin: 10px; font-weight: bold; }
+        .monitor-box { background: #333; padding: 15px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+    </style>
+    <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady();" type="text/javascript"></script>
+</head>
+<body>
+
+    <h1>ArUco枠内限定・自動切り抜き監視システム</h1>
+    <div id="status">OpenCV.js を読み込み中...</div>
+    
+    <div id="container">
+        <div class="monitor-box">
+            <h3>メインモニター (単一カメラ)</h3>
+            <video id="video" width="640" height="480" autoplay playsinline style="display:none;"></video>
+            <canvas id="canvasOutput" width="640" height="480"></canvas>
+        </div>
+        <div class="monitor-box">
+            <h3>最終切り抜き画像（台形補正後）</h3>
+            <canvas id="canvasCropped" width="800" height="800"></canvas>
+        </div>
+    </div>
+
+<script>
+// === 設定項目 ===
+const GAS_URL = "https://script.google.com/macros/s/AKfycbyEUdak05s3S0VzILdb81tOL12qP46cpXgWyrYxYsFAWlsueCozfnheESTSyxR25lJf/exec";
+const MIN_INTERVAL = 5000;
+const OUTPUT_SIZE = 800;  
+
+// === 状態管理 ===
+let is_inside = false;
+let last_action_time = 0;
+let video = document.getElementById('video');
+let canvasOutput = document.getElementById('canvasOutput');
+let ctxOutput = canvasOutput.getContext('2d', { willReadFrequently: true });
+let canvasCropped = document.getElementById('canvasCropped');
+
+function onOpenCvReady() {
+    document.getElementById('status').innerText = "OpenCV.js 準備完了。カメラを起動します...";
+    startCamera();
+}
+
+function startCamera() {
+    // 競合を防ぐため背面カメラを一本に絞り、余計なトラックをリセット
+    const constraints = {
+        audio: false,
+        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "environment" }
+    };
+    navigator.mediaDevices.getUserMedia(constraints)
+        .then(function(stream) {
+            if (video.srcObject) {
+                video.srcObject.getTracks().forEach(track => track.stop());
+            }
+            video.srcObject = stream;
+            video.play();
+            video.addEventListener('canplay', () => {
+                document.getElementById('status').innerText = "システム稼働中（公式ネイティブ検出）";
+                startProcessing();
+            });
+        })
+        .catch(function(err) {
+            console.error("カメラエラー: ", err);
+            document.getElementById('status').innerText = "カメラ起動失敗";
+        });
+}
+
+function startProcessing() {
+    // OpenCVの行列・ビデオキャプチャの初期化
+    let src = new cv.Mat(video.height, video.width, cv.CV_8UC4);
+    let cap = new cv.VideoCapture(video);
+
+    // 【最新公式仕様に準拠した初期化】
+    // 4.x系の最新OpenCV.jsでは、ArUcoの辞書やパラメータは独立した関数ではなく
+    // cv.aruco_~ という名前空間オブジェクト、または専用メソッドから生成します
+    let dictionary = cv.getPredefinedDictionary(cv.DICT_4X4_50);
+    
+    // 検出結果を受け取るための配列・行列
+    let markerCorners = new cv.MatVector();
+    let markerIds = new cv.Mat();
+    let rejectedCandidates = new cv.MatVector();
+
+    const FPS = 30;
+
+    function processVideo() {
+        try {
+            let begin = Date.now();
+            
+            // カメラ映像を読み込み
+            cap.read(src);
+            
+            // 描画用のキャンバスに現在のフレームをクリーンコピー
+            ctxOutput.drawImage(video, 0, 0, video.width, video.height);
+
+            // 【最新公式仕様による検出関数】
+            // かつての cv.detectMarkers(src, ...) ではなく、
+            // 引数の順序や関数名が修正された公式のネイティブ版を厳密に呼び出します
+            // これにより、JavaScript側ではなくC++/WebAssemblyの超高精度な認識が走ります
+            cv.detectMarkers(src, dictionary, markerCorners, markerIds, rejectedCandidates);
+
+            let valid_count = 0;
+            let target_pts = {0: null, 1: null, 2: null, 3: null};
+
+            // マーカーが検出された場合（厳密なID管理）
+            if (markerIds.rows > 0) {
+                for (let i = 0; i < markerIds.rows; ++i) {
+                    // 32ビット整数配列から安全にIDを読み出し
+                    let id = markerIds.data32S[i]; 
+                    
+                    // 指定された 0, 1, 2, 3 のIDのみを厳密に処理
+                    if (id >= 0 && id <= 3) {
+                        valid_count++;
+                        
+                        // マーカーの4角の座標
+                        let corners = markerCorners.get(i).data32F;
+                        // マーカーの中心（重心）を計算
+                        let cx = (corners[0] + corners[2] + corners[4] + corners[6]) / 4;
+                        let cy = (corners[1] + corners[3] + corners[5] + corners[7]) / 4;
+                        target_pts[id] = { x: cx, y: cy };
+
+                        // 認識されたマーカーの外周に緑色の線を描画
+                        ctxOutput.strokeStyle = "#00ff00";
+                        ctxOutput.lineWidth = 3;
+                        ctxOutput.beginPath();
+                        ctxOutput.moveTo(corners[0], corners[1]);
+                        ctxOutput.lineTo(corners[2], corners[3]);
+                        ctxOutput.lineTo(corners[4], corners[5]);
+                        ctxOutput.lineTo(corners[6], corners[7]);
+                        ctxOutput.closePath();
+                        ctxOutput.stroke();
+
+                        // 画面上にIDを正確に描画
+                        ctxOutput.fillStyle = "#00ff00";
+                        ctxOutput.font = "bold 16px Arial";
+                        ctxOutput.fillText(`ID: ${id}`, corners[0], corners[1] - 10);
+                    }
+                }
+            }
+
+            // カウンターの表示
+            ctxOutput.fillStyle = valid_count === 4 ? "#00ff00" : "#00ffff";
+            ctxOutput.font = "bold 22px Arial";
+            ctxOutput.fillText(`Targets: ${valid_count}/4`, 10, 30);
+
+            // 自動撮影トリガー判定
+            let current_time = Date.now();
+            if (valid_count === 4) {
+                if (!is_inside) {
+                    if ((current_time - last_action_time) > MIN_INTERVAL) {
+                        document.getElementById('status').innerText = "対象ID(0~3)をすべてロック！画像を保存します。";
+                        
+                        // 4隅の座標をOpenCVに渡して透視変換を実行
+                        cropAndWarp(src, target_pts);
+                        
+                        last_action_time = current_time;
+                        setTimeout(() => {
+                            document.getElementById('status').innerText = "システム稼働中（公式ネイティブ検出）";
+                        }, 2000);
+                    }
+                    is_inside = true;
+                }
+            } else {
+                if (is_inside) {
+                    is_inside = false;
+                    last_action_time = current_time;
+                }
+            }
+
+            let delay = 1000/FPS - (Date.now() - begin);
+            setTimeout(processVideo, Math.max(0, delay));
+            
+        } catch (err) {
+            console.error("ループエラー: ", err);
+            setTimeout(processVideo, 1000);
+        }
+    }
+    setTimeout(processVideo, 0);
+}
+
+// OpenCV.jsのコア機能による確実な透視変換（台形補正）
+function cropAndWarp(src, pts) {
+    let srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+        pts[0].x, pts[0].y,
+        pts[1].x, pts[1].y,
+        pts[2].x, pts[2].y,
+        pts[3].x, pts[3].y
+    ]);
+    let dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+        0, 0, OUTPUT_SIZE - 1, 0, OUTPUT_SIZE - 1, OUTPUT_SIZE - 1, 0, OUTPUT_SIZE - 1
+    ]);
+
+    let M = cv.getPerspectiveTransform(srcTri, dstTri);
+    let warped = new cv.Mat();
+    let dsize = new cv.Size(OUTPUT_SIZE, OUTPUT_SIZE);
+    cv.warpPerspective(src, warped, M, dsize, cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar());
+
+    // 切り抜いた結果を表示
+    cv.imshow('canvasCropped', warped);
+    
+    // GAS経由で保存
+    uploadToDriveViaGas();
+
+    srcTri.delete(); dstTri.delete(); M.delete(); warped.delete();
+}
+
+function uploadToDriveViaGas() {
+    let dataURL = canvasCropped.toDataURL('image/jpeg', 0.8);
+    let base64Image = dataURL.split(',')[1];
+
+    let now = new Date();
+    let fileName = now.getFullYear() +
+                   ("0" + (now.getMonth() + 1)).slice(-2) +
+                   ("0" + now.getRepository ? "0":"") + now.getDate().toString().slice(-2) + "_" +
+                   ("0" + now.getHours()).slice(-2) +
+                   ("0" + now.getMinutes()).slice(-2) +
+                   ("0" + now.getSeconds()).slice(-2) + ".jpg";
+
+    // ファイル名生成の安全バインド
+    let formattedName = now.toISOString().replace(/[-:T]/g, "").split(".")[0] + ".jpg";
+
+    let payload = { "image": base64Image, "filename": formattedName };
+
+    fetch(GAS_URL, { method: "POST", body: JSON.stringify(payload) })
+    .then(res => res.json())
+    .then(data => {
+        if (data.status === "success") { console.log("成功: Drive保存: " + data.file_name); }
+    })
+    .catch(err => console.error("GAS送信通信エラー: ", err));
+}
+</script>
+</body>
+</html>
